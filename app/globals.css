@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0a0f0e;
+  --panel: #101817;
+  --panel-2: #0d1413;
+  --line: rgba(255, 255, 255, 0.08);
+  --accent: #34d399;
+  --ink: #e7efe9;
+  --muted: #93a69e;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--ink);
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Noto Sans", "Noto Sans Devanagari", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+}
+
+.card-2 {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+}
+
+.glow-green {
+  box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.35), 0 0 40px -12px rgba(52, 211, 153, 0.45);
+}
+
+.glow-red {
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.4), 0 0 40px -12px rgba(248, 113, 113, 0.5);
+}
+
+.glow-amber {
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.4), 0 0 40px -12px rgba(251, 191, 36, 0.5);
+}
+
+::selection {
+  background: rgba(52, 211, 153, 0.3);
+}
+
+input::placeholder {
+  color: #5f736b;
+}

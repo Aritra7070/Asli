@@ -1,0 +1,33 @@
+{
+  "name": "asli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Asli — the honest scan for medicine in India. Batch verification with wallet-signed attestations on Arkiv (Tiramisu testnet).",
+  "license": "MIT",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "wallets:new": "node scripts/wallets.mjs",
+    "wallets:fund": "node scripts/fund.mjs",
+    "seed": "node scripts/seed.mjs",
+    "reproduce": "node scripts/reproduce.mjs",
+    "vercel:env": "node scripts/vercel-env.mjs"
+  },
+  "dependencies": {
+    "@arkiv-network/sdk": "^0.8.1",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}
