@@ -8,9 +8,9 @@ export const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL ??
   "wss://rpc.tiramisu.db-chain.testnet.arkiv.network";
 
-// Update after the repo is pushed.
+// Public source repo (submission gate: public + MIT).
 export const GITHUB_URL =
-  process.env.NEXT_PUBLIC_GITHUB_URL ?? "https://github.com/arkiv-network";
+  process.env.NEXT_PUBLIC_GITHUB_URL ?? "https://github.com/Aritra7070/Asli";
 
 export const ENTITY_TYPE = {
   batch: "batch",

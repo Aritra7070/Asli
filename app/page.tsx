@@ -27,12 +27,11 @@ const WHY = [
 export default async function Home() {
   let counts = { batches: 0, scans: 0, flags: 0, registries: 0 };
   let feed: FeedItem[] = [];
-  try {
-    counts = await getCounts();
-    feed = await getLatestFeed(10);
-  } catch {
-    // chain unreachable — render the page anyway
-  }
+  // Both reads in one wave; either may fail while the testnet RPC stalls —
+  // the page renders with what came back (the server layer keeps a cache).
+  const [c, f] = await Promise.allSettled([getCounts(), getLatestFeed(10)]);
+  if (c.status === "fulfilled") counts = c.value;
+  if (f.status === "fulfilled") feed = f.value;
 
   return (
     <div className="mt-10 space-y-10">

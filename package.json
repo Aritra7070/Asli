@@ -12,6 +12,7 @@
     "wallets:fund": "node scripts/fund.mjs",
     "seed": "node scripts/seed.mjs",
     "reproduce": "node scripts/reproduce.mjs",
+    "rpc:health": "node scripts/latency.mjs",
     "vercel:env": "node scripts/vercel-env.mjs"
   },
   "dependencies": {

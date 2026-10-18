@@ -184,5 +184,33 @@ the parts we lived with.)
 
 ---
 
-_Running total: 14 items. Friction is data — this file is updated as we hit
+## 15. The testnet RPC can stall for minutes — queries hang, pages freeze
+
+- **Expected:** the same `select()` that answered in ~300 ms two minutes
+  earlier keeps working; if the node is overloaded it fails fast.
+- **Actual:** on the final build day the query surface entered a window where
+  single `arkiv_query` calls **never returned at all**: a probe we let run was
+  still pending after **300 s**, and a page render logged
+  `GET / 200 in 180014ms`. `eth_blockNumber` on the *same endpoint* stayed
+  under 1 s throughout, so it was queries specifically — and the window passed
+  by itself: minutes later 24 identical back-to-back queries answered in
+  300–900 ms, and an 8-way parallel burst finished in 863 ms.
+- **Why it burned us:** viem's transport `timeout`/`retryCount` did not reject
+  the hung calls (nothing threw for minutes), and the SDK exposes no deadline
+  knob. In a server framework one hung read *is* a hung page — which from the
+  outside is indistinguishable from "the site is broken".
+- **Workaround shipped (in this repo):** every chain read now runs under a
+  12 s deadline with one retry; hot reads (`counts`, `feed`, `batch:<code>`,
+  `radar`, `registries`) are served **stale-while-revalidate** from a small
+  in-memory cache, so a stalled RPC degrades to slightly-stale-but-instant
+  pages instead of a frozen site; successful writes bust the cache so the
+  demo always shows its own effects. Diagnostic kept in-repo:
+  `npm run rpc:health` (per-query latency probe).
+- **Ask:** a documented server-side maximum runtime for `arkiv_query` (or a
+  `timeoutMs` request option). Knowing "the node kills a query after N
+  seconds" would let clients pick the right deadline instead of guessing.
+
+---
+
+_Running total: 15 items. Friction is data — this file is updated as we hit
 more, and shipped as-is._

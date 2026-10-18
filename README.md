@@ -51,13 +51,22 @@ npm run wallets:new        # generates 6 throwaway testnet signers into .env.loc
 #      to the 6 addresses printed by wallets:new
 
 npm run seed               # writes the synthetic demo world to Tiramisu
-npm run dev                # http://localhost:3000
+npm run dev                # http://localhost:3000 (hot reload)
+
+# runtime mode (what judges hit on the Vercel deploy — also the snappiest local demo):
+npm run build && npm run start   # http://localhost:3000, production build
 ```
 
 No wallet? No problem — the **demo buttons on the home page sign with the
 project's disposable testnet wallets**, so judges and visitors can trigger
 real writes (a pharmacy scan, a public report, a counterfeit shipment) and
 watch the live feed react.
+
+The server layer treats the shared testnet RPC defensively: every read runs
+under a 12 s deadline with one retry, and hot reads are served
+stale-while-revalidate from a tiny in-memory cache — brief RPC stalls degrade
+to slightly-stale pages instead of a frozen site (see `arkiv/friction.md` #15,
+and `npm run rpc:health` for a live latency probe).
 
 ## Verify us without us
 
@@ -78,7 +87,7 @@ lib/arkiv-server.ts Reads (public client) + demo writes (role signers) — the v
 lib/{types,feed,constants}.ts
 scripts/            wallets.mjs · fund.mjs · seed.mjs · reproduce.mjs · vercel-env.mjs
 arkiv/schema.md     Entity design: attributes, expiries, flags, queries, what stays off Arkiv
-arkiv/friction.md   Honest expected-vs-actual log from building on Arkiv (14 items, with versions and repro steps)
+arkiv/friction.md   Honest expected-vs-actual log from building on Arkiv (15 items, with versions and repro steps)
 ```
 
 ## Stack

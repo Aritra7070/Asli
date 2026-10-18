@@ -39,8 +39,90 @@ const ROLE_ENV: Record<Role, string> = {
 
 export const publicClient = createPublicClient({
   chain: tiramisu,
-  transport: http(RPC_URL),
+  transport: http(RPC_URL, {
+    timeout: 10_000,
+    retryCount: 1,
+  }),
 });
+
+// ---------------------------------------------------------- resilience
+// The Tiramisu RPC can stall under load (we measured single queries hanging
+// 180s+ during the final-day rush, while the same query answered in <1s
+// minutes later). Two defenses keep the app alive through those windows:
+//   1. every chain read goes through a deadline + one retry, so a hung
+//      request fails fast instead of freezing a page render;
+//   2. hot reads are served from a small in-memory cache with
+//      stale-while-revalidate — when the RPC is slow, pages keep rendering
+//      the last good copy and refresh in the background.
+// Writes bust the cache so the demo always shows its own writes.
+
+const READ_DEADLINE_MS = 12_000;
+
+function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label}: no response in ${ms}ms`)),
+      ms
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      }
+    );
+  });
+}
+
+async function chainCall<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await withDeadline(fn(), READ_DEADLINE_MS, label);
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("no response in")) {
+      // one retry — a fresh request usually gets a fresh connection
+      return await withDeadline(fn(), READ_DEADLINE_MS, `${label} (retry)`);
+    }
+    throw e;
+  }
+}
+
+type CacheEntry = { at: number; value: unknown };
+const readCache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<unknown>>();
+
+/** Call after any successful write so the next render shows it immediately. */
+export function bustReadCache() {
+  readCache.clear();
+}
+
+async function swr<T>(
+  key: string,
+  ttlMs: number,
+  fn: () => Promise<T>
+): Promise<T> {
+  const hit = readCache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.value as T;
+  if (hit) {
+    // expired — serve instantly, refresh in the background
+    void fn()
+      .then((value) => readCache.set(key, { at: Date.now(), value }))
+      .catch(() => {});
+    return hit.value as T;
+  }
+  const running = inflight.get(key);
+  if (running) return running as Promise<T>;
+  const p = fn()
+    .then((value) => {
+      readCache.set(key, { at: Date.now(), value });
+      return value;
+    })
+    .finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
 
 // ---------------------------------------------------------------- wallets
 
@@ -63,7 +145,10 @@ export function walletFor(role: Role) {
   const account = privateKeyToAccount(pk as `0x${string}`, { nonceManager });
   const client = createWalletClient({
     chain: tiramisu,
-    transport: http(RPC_URL),
+    transport: http(RPC_URL, {
+      timeout: 15_000,
+      retryCount: 1,
+    }),
     account,
   });
   walletCache.set(role, client);
@@ -91,8 +176,8 @@ async function nextExpiryBlock(
   entityKey: string,
   days: number
 ): Promise<bigint> {
-  const { expiresAt } = await publicClient.getEntity(
-    entityKey as `0x${string}`
+  const { expiresAt } = await chainCall("getEntity", () =>
+    publicClient.getEntity(entityKey as `0x${string}`)
   );
   const raw = expiresAt as unknown as bigint | number;
   const current = typeof raw === "bigint" ? raw : BigInt(raw);
@@ -165,15 +250,14 @@ function stripUndefined<T extends Record<string, unknown>>(
 
 async function fetchAll(where: unknown, limit = 200): Promise<E[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let page: any = await (publicClient as any)
-    .select(SEL)
-    .where(where)
-    .limit(limit)
-    .fetch();
+  let page: any = await chainCall("arkiv query", () =>
+    (publicClient as any).select(SEL).where(where).limit(limit).fetch()
+  );
   const out: E[] = [...page.entities];
   let guard = 0;
   while (page.hasNextPage() && guard++ < 20) {
-    page = await page.next();
+    const prev = page;
+    page = await chainCall("arkiv query (next page)", () => prev.next());
     out.push(...page.entities);
   }
   return out;
@@ -181,33 +265,33 @@ async function fetchAll(where: unknown, limit = 200): Promise<E[]> {
 
 async function fetchWhere(where: unknown, limit = 200): Promise<E[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const page: any = await (publicClient as any)
-    .select(SEL)
-    .where(where)
-    .limit(limit)
-    .fetch();
+  const page: any = await chainCall("arkiv query", () =>
+    (publicClient as any).select(SEL).where(where).limit(limit).fetch()
+  );
   return page.entities as E[];
 }
 
 // ---------------------------------------------------------------- reads
 
 export async function fetchRegistries(): Promise<Record<string, Registry>> {
-  const entities = await fetchAll(eq("type", str("asli.registry")));
-  const map: Record<string, Registry> = {};
-  for (const e of entities) {
-    const wallet = attrAddr(e, "wallet_addr");
-    if (!wallet) continue;
-    map[wallet.toLowerCase()] = {
-      wallet,
-      name: attrStr(e, "name") ?? "(unnamed)",
-      city: attrStr(e, "city") ?? "",
-      role: attrStr(e, "role") ?? "",
-      sinceMs: attrNum(e, "since_ms"),
-      entityKey: e.key,
-      registeredAtBlock: e.createdAt,
-    };
-  }
-  return map;
+  return swr("registries", 30_000, async () => {
+    const entities = await fetchAll(eq("type", str("asli.registry")));
+    const map: Record<string, Registry> = {};
+    for (const e of entities) {
+      const wallet = attrAddr(e, "wallet_addr");
+      if (!wallet) continue;
+      map[wallet.toLowerCase()] = {
+        wallet,
+        name: attrStr(e, "name") ?? "(unnamed)",
+        city: attrStr(e, "city") ?? "",
+        role: attrStr(e, "role") ?? "",
+        sinceMs: attrNum(e, "since_ms"),
+        entityKey: e.key,
+        registeredAtBlock: e.createdAt,
+      };
+    }
+    return map;
+  });
 }
 
 function toAttestation(e: E): Attestation {
@@ -267,9 +351,9 @@ function toFlag(e: E): FlagRecord {
 }
 
 /** The full verification report for one batch code — everything /b/[code] renders. */
-export async function getBatchReport(code: string): Promise<BatchReport> {
+async function computeBatchReport(code: string): Promise<BatchReport> {
   const [head, entities, registries] = await Promise.all([
-    publicClient.getBlockNumber(),
+    chainCall("blockNumber", () => publicClient.getBlockNumber()),
     fetchWhere(eq("batch_code", str(code))),
     fetchRegistries(),
   ]);
@@ -334,11 +418,20 @@ export async function getBatchReport(code: string): Promise<BatchReport> {
   };
 }
 
+/** Cached getter — writes bust the cache (see bustReadCache). */
+export async function getBatchReport(code: string): Promise<BatchReport> {
+  return swr(`batch:${code}`, 15_000, () => computeBatchReport(code));
+}
+
 export async function getRadar(soonDays = 45): Promise<RadarData> {
+  return swr(`radar:${soonDays}`, 30_000, () => computeRadar(soonDays));
+}
+
+async function computeRadar(soonDays = 45): Promise<RadarData> {
   const soonMs = Date.now() + soonDays * 86_400_000;
   const [head, soonBatchEntities, allBatchEntities, recallEntities, allFlags, custody, registries] =
     await Promise.all([
-      publicClient.getBlockNumber(),
+      chainCall("blockNumber", () => publicClient.getBlockNumber()),
       fetchWhere(
         and(eq("type", str("asli.batch")), lte("exp_at_ms", u64(soonMs))),
         200
@@ -388,18 +481,20 @@ export async function getRadar(soonDays = 45): Promise<RadarData> {
 }
 
 export async function getCounts() {
-  const [batches, custody, flags, registries] = await Promise.all([
-    fetchAll(eq("type", str("asli.batch"))),
-    fetchAll(eq("type", str("asli.custody"))),
-    fetchAll(eq("type", str("asli.flag"))),
-    fetchAll(eq("type", str("asli.registry"))),
-  ]);
-  return {
-    batches: batches.length,
-    scans: custody.length,
-    flags: flags.length,
-    registries: registries.length,
-  };
+  return swr("counts", 15_000, async () => {
+    const [batches, custody, flags, registries] = await Promise.all([
+      fetchAll(eq("type", str("asli.batch"))),
+      fetchAll(eq("type", str("asli.custody"))),
+      fetchAll(eq("type", str("asli.flag"))),
+      fetchAll(eq("type", str("asli.registry"))),
+    ]);
+    return {
+      batches: batches.length,
+      scans: custody.length,
+      flags: flags.length,
+      registries: registries.length,
+    };
+  });
 }
 
 export function toFeedItem(e: E, head: bigint): FeedItem {
@@ -444,18 +539,22 @@ export function toFeedItem(e: E, head: bigint): FeedItem {
 }
 
 export async function getLatestFeed(limit = 12): Promise<FeedItem[]> {
-  const head = await publicClient.getBlockNumber();
-  // One query per entity type (the query language has no OR across separate
-  // attribute sets that we can rely on), merged and sorted newest-first.
-  const [batches, custody, flags] = await Promise.all([
-    fetchWhere(eq("type", str("asli.batch")), limit),
-    fetchWhere(eq("type", str("asli.custody")), limit),
-    fetchWhere(eq("type", str("asli.flag")), limit),
-  ]);
-  return [...batches, ...custody, ...flags]
-    .map((e) => toFeedItem(e, head))
-    .sort((a, b) => Number(b.atBlock - a.atBlock))
-    .slice(0, limit);
+  return swr(`feed:${limit}`, 10_000, async () => {
+    const head = await chainCall("blockNumber", () =>
+      publicClient.getBlockNumber()
+    );
+    // One query per entity type (the query language has no OR across separate
+    // attribute sets that we can rely on), merged and sorted newest-first.
+    const [batches, custody, flags] = await Promise.all([
+      fetchWhere(eq("type", str("asli.batch")), limit),
+      fetchWhere(eq("type", str("asli.custody")), limit),
+      fetchWhere(eq("type", str("asli.flag")), limit),
+    ]);
+    return [...batches, ...custody, ...flags]
+      .map((e) => toFeedItem(e, head))
+      .sort((a, b) => Number(b.atBlock - a.atBlock))
+      .slice(0, limit);
+  });
 }
 
 // ---------------------------------------------------------------- writes
@@ -509,6 +608,7 @@ export async function addCustodyScan(opts: {
     extensions,
   });
 
+  bustReadCache();
   return {
     txHash: res.txHash as string,
     entityKey: (res.createdEntities?.[0] ?? undefined) as string | undefined,
@@ -541,6 +641,7 @@ export async function createFlag(opts: {
     // A flag is a record: write-once, and ANY wallet can keep it alive.
     flags: { readonly: true, permissionlessExtension: true },
   });
+  bustReadCache();
   return { txHash: res.txHash as string, entityKey: res.entityKey as string };
 }
 
@@ -590,6 +691,7 @@ export async function counterfeitShipment(opts: {
       },
     ],
   });
+  bustReadCache();
   return {
     txHash: res.txHash as string,
     entityKeys: (res.createdEntities ?? []) as string[],
@@ -607,5 +709,6 @@ export async function extendByKey(
     // "N more days" added to the *current* deadline — see nextExpiryBlock.
     expires: ExpirationTime.atBlock(await nextExpiryBlock(entityKey, days)),
   });
+  bustReadCache();
   return { txHash: res.txHash as string, expiresAt: res.expiresAt as bigint };
 }

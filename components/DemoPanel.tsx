@@ -69,7 +69,7 @@ export default function DemoPanel() {
 
   async function run(a: Action) {
     setBusy(a.key);
-    setResult(`Writing "${a.label}"… (signing + mining, ~2s)`);
+    setResult(`Writing "${a.label}"… (signing + mining — usually a few seconds)`);
     try {
       const res = await fetch(a.url, {
         method: "POST",
