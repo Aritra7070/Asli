@@ -19,3 +19,6 @@ next-env.d.ts
 
 # runtime read-cache (local last-good copies; the committed fallback is arkiv/cache-snapshot.json)
 .cache/
+
+.vercel
+.env*

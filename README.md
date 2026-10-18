@@ -10,6 +10,8 @@ impossible to quietly edit.
 Built for the **Arkiv: Global Tour Stop** (Devcon 8), competing in
 **Best Indian Use Case**, **Censorship Resistance** and **Security**.
 
+**Live demo:** [asli-nu.vercel.app](https://asli-nu.vercel.app) · **Source:** [github.com/Aritra7070/Asli](https://github.com/Aritra7070/Asli)
+
 ---
 
 ## The problem, dated (all of this really happened)
