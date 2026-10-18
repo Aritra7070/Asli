@@ -99,12 +99,16 @@ the parts we lived with.)
 ## 9. Public RPC is heavily rate-limited
 
 - **Expected:** the public Tiramisu RPC would serve a hackathon demo.
-- **Actual:** it does, but the docs call it "heavily rate limited and meant for
-  testing", and parallel page loads make it visible (slower page renders when
-  many queries fire at once).
-- **Workaround:** pages issue few, focused queries; entity pages query once per
-  request (deduplicated between `generateMetadata` and the page via React
-  `cache`). A production deployment would use an Arkiv access key server-side.
+- **Actual:** it does — until the **shared anonymous query budget runs out**
+  under load. Then the HTTP surface hangs silently while the WebSocket
+  surface returns `unauthenticated query budget exhausted` (see #15 for the
+  full hunt; we misread it as "the RPC stalls sometimes" for most of build
+  day).
+- **Workaround:** the app now supports an Arkiv access key
+  (`ARKIV_ACCESS_KEY`, sent as an `X-API-KEY` header server-side;
+  `NEXT_PUBLIC_ARKIV_ACCESS_KEY`, in the URL path for the browser live feed)
+  — one key per wallet per network, free. Lesson: don't wait to hit the
+  budget; create a key *before* demo day.
 
 ## 10. Funding six signers for a no-wallet demo
 
@@ -184,31 +188,52 @@ the parts we lived with.)
 
 ---
 
-## 15. The testnet RPC can stall for minutes — queries hang, pages freeze
+## 15. "RPC stalls" were the anonymous query budget running out — and HTTP hides it
 
 - **Expected:** the same `select()` that answered in ~300 ms two minutes
-  earlier keeps working; if the node is overloaded it fails fast.
-- **Actual:** on the final build day the query surface entered a window where
-  single `arkiv_query` calls **never returned at all**: a probe we let run was
-  still pending after **300 s**, and a page render logged
-  `GET / 200 in 180014ms`. `eth_blockNumber` on the *same endpoint* stayed
-  under 1 s throughout, so it was queries specifically — and the window passed
-  by itself: minutes later 24 identical back-to-back queries answered in
-  300–900 ms, and an 8-way parallel burst finished in 863 ms.
+  earlier keeps working; if the node is overloaded (or we're over quota) it
+  fails fast with an error we can show.
+- **Actual (the long version):** on submission day the query surface entered
+  windows where single `arkiv_query` calls **never returned at all** — one
+  probe sat pending for **300 s**; a page render logged `GET / 200 in
+  180014ms`. `eth_blockNumber` on the *same endpoint* stayed under 1 s, and
+  the windows "passed by themselves" (minutes later, 24 back-to-back queries
+  answered in 300–900 ms). So we spent build day treating it as transient
+  overload.
+- **Root cause, found late and by accident:** a probe against the **WebSocket**
+  endpoint returned the real story in 1.9 s — `unauthenticated query budget
+  exhausted; get an API key at https://hub.arkiv.network for a monthly quota`.
+  The "stalls" were the **shared anonymous budget being exhausted** (peak
+  submission-day traffic — our own refresh traffic included). Cruelly, the
+  **HTTP gateway hangs** on a depleted budget while the **WebSocket returns
+  the error immediately**: same key, opposite failure modes.
 - **Why it burned us:** viem's transport `timeout`/`retryCount` did not reject
-  the hung calls (nothing threw for minutes), and the SDK exposes no deadline
-  knob. In a server framework one hung read *is* a hung page — which from the
-  outside is indistinguishable from "the site is broken".
-- **Workaround shipped (in this repo):** every chain read now runs under a
-  12 s deadline with one retry; hot reads (`counts`, `feed`, `batch:<code>`,
-  `radar`, `registries`) are served **stale-while-revalidate** from a small
-  in-memory cache, so a stalled RPC degrades to slightly-stale-but-instant
-  pages instead of a frozen site; successful writes bust the cache so the
-  demo always shows its own effects. Diagnostic kept in-repo:
-  `npm run rpc:health` (per-query latency probe).
-- **Ask:** a documented server-side maximum runtime for `arkiv_query` (or a
-  `timeoutMs` request option). Knowing "the node kills a query after N
-  seconds" would let clients pick the right deadline instead of guessing.
+  the hung calls, and the SDK exposes no deadline knob — so in a server
+  framework one hung read *is* a hung page, indistinguishable from "the site
+  is broken". (Our Radar page showed its "unavailable" card while the data
+  was fine on-chain.)
+- **Fix shipped (in this repo):**
+  1. **Access-key support.** `ARKIV_ACCESS_KEY` is sent server-side as an
+     `X-API-KEY` header; `NEXT_PUBLIC_ARKIV_ACCESS_KEY` goes in the URL path
+     for the browser's live-feed WebSocket (browser WebSockets cannot set
+     headers). This is the actual cure, not a workaround.
+  2. **A 6 s read deadline + one retry** per chain read, so a hung request
+     fails fast instead of freezing a render.
+  3. **Stale-while-revalidate cache** for the hot reads (`counts`, `feed`,
+     `batch:<code>`, `radar`, `registries`) — persisted to disk
+     (`.cache/reads.json`) with a committed cold-start snapshot
+     (`arkiv/cache-snapshot.json`); writes mark cached reads stale instead of
+     clearing them; a self-healing warmer refetches the demo pages every 45 s.
+  Diagnostics in-repo: `npm run rpc:health` — it probes **both** surfaces and
+  prints the real error. That probe is how this was finally found.
+- **Ask:**
+  1. Make the HTTP gateway surface the rate-limit error the way WebSocket
+     does — hanging on a depleted budget is the worst of both worlds.
+  2. Document that the anonymous budget is shared and can vanish for hours;
+     put "get an access key before your demo" where people will see it.
+  3. Publish a server-side maximum runtime for `arkiv_query` (or a
+     `timeoutMs` request option) so clients can pick deadlines instead of
+     guessing.
 
 ---
 

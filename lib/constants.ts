@@ -8,6 +8,19 @@ export const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL ??
   "wss://rpc.tiramisu.db-chain.testnet.arkiv.network";
 
+// The shared RPC's anonymous query budget runs out under load (it did on
+// submission day — see arkiv/friction.md #15). An Arkiv access key raises the
+// limit; create one at https://hub.arkiv.network/api-keys (one per wallet per
+// network, select Tiramisu). The server sends its copy as an X-API-KEY header
+// (ARKIV_ACCESS_KEY); the browser appends this one to the URL path because a
+// browser WebSocket cannot set custom headers. It is a revocable quota key,
+// not a signing key — a production app would proxy reads server-side instead.
+export function withAccessKey(url: string): string {
+  const key = process.env.NEXT_PUBLIC_ARKIV_ACCESS_KEY;
+  if (!key) return url;
+  return `${url.replace(/\/+$/, "")}/${encodeURIComponent(key)}`;
+}
+
 // Public source repo (submission gate: public + MIT).
 export const GITHUB_URL =
   process.env.NEXT_PUBLIC_GITHUB_URL ?? "https://github.com/Aritra7070/Asli";

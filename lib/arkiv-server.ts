@@ -2,6 +2,9 @@
 // Signer keys come from env vars (.env.local or Vercel project env). They are
 // throwaway Tiramisu testnet keys used only to sign synthetic demo data.
 
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
 import {
   createPublicClient,
   createWalletClient,
@@ -14,7 +17,8 @@ import { and, eq, lte } from "@arkiv-network/sdk/query";
 import { http } from "viem";
 import { nonceManager, privateKeyToAccount } from "viem/accounts";
 
-import { RPC_URL } from "@/lib/constants";
+import bundledSnapshot from "@/arkiv/cache-snapshot.json";
+import { DEMO, RPC_URL } from "@/lib/constants";
 import type {
   Attestation,
   BatchReport,
@@ -37,26 +41,41 @@ const ROLE_ENV: Record<Role, string> = {
   fake: "ASLI_FAKE_PRIVATE_KEY",
 };
 
+// Optional access key for the shared RPC — raises the anonymous query budget,
+// which really does run out under load (see arkiv/friction.md #15). Sent as
+// an X-API-KEY header so the key never appears in URLs or request logs.
+const ACCESS_KEY =
+  process.env.ARKIV_ACCESS_KEY ??
+  process.env.NEXT_PUBLIC_ARKIV_ACCESS_KEY ??
+  "";
+
+function rpcAuth(): { fetchOptions?: { headers: Record<string, string> } } {
+  return ACCESS_KEY
+    ? { fetchOptions: { headers: { "X-API-KEY": ACCESS_KEY } } }
+    : {};
+}
+
 export const publicClient = createPublicClient({
   chain: tiramisu,
   transport: http(RPC_URL, {
     timeout: 10_000,
     retryCount: 1,
+    ...rpcAuth(),
   }),
 });
 
 // ---------------------------------------------------------- resilience
-// The Tiramisu RPC can stall under load (we measured single queries hanging
-// 180s+ during the final-day rush, while the same query answered in <1s
-// minutes later). Two defenses keep the app alive through those windows:
-//   1. every chain read goes through a deadline + one retry, so a hung
+// The Tiramisu RPC chokes under load — and the WebSocket transport finally
+// showed why: "unauthenticated query budget exhausted" (an access key raises
+// the quota; the HTTP surface hangs silently instead of returning that error
+// — see arkiv/friction.md #15). Three defenses keep the app alive:
+//   1. an access key when configured (see rpcAuth above) — the real cure;
+//   2. every chain read goes through a deadline + one retry, so a hung
 //      request fails fast instead of freezing a page render;
-//   2. hot reads are served from a small in-memory cache with
-//      stale-while-revalidate — when the RPC is slow, pages keep rendering
-//      the last good copy and refresh in the background.
-// Writes bust the cache so the demo always shows its own writes.
+//   3. hot reads are served from a cache with stale-while-revalidate —
+//      when the RPC is slow, pages keep rendering the last good copy.
 
-const READ_DEADLINE_MS = 12_000;
+const READ_DEADLINE_MS = 6_000;
 
 function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -93,9 +112,108 @@ type CacheEntry = { at: number; value: unknown };
 const readCache = new Map<string, CacheEntry>();
 const inflight = new Map<string, Promise<unknown>>();
 
-/** Call after any successful write so the next render shows it immediately. */
+// ---------------------------------------------------- cache persistence
+// Last-good copies are persisted so a restart — or a fresh serverless
+// instance on a cold deploy — can still serve data while the shared RPC is
+// stalled. Two sources, newest timestamp wins:
+//   * arkiv/cache-snapshot.json — a snapshot committed to the repo and
+//     bundled into the build (survives cold starts on Vercel);
+//   * .cache/reads.json — the live cache this process keeps updating
+//     (git-ignored; local runtime — writes fail silently on read-only fs).
+
+const CACHE_VERSION = 1;
+const LOCAL_CACHE_FILE = path.join(process.cwd(), ".cache", "reads.json");
+
+type CacheFile = { version: number; entries: Record<string, CacheEntry> };
+
+function encodeCache(): string {
+  const entries: Record<string, CacheEntry> = {};
+  for (const [k, v] of readCache) entries[k] = v;
+  return JSON.stringify(
+    { version: CACHE_VERSION, entries } as CacheFile,
+    (_k, v) => (typeof v === "bigint" ? { __bigint: v.toString() } : v)
+  );
+}
+
+function decodeCache(raw: string): CacheFile | null {
+  try {
+    const parsed = JSON.parse(raw, (_k, v) =>
+      v && typeof v === "object" && "__bigint" in (v as object)
+        ? BigInt((v as { __bigint: string }).__bigint)
+        : v
+    ) as CacheFile;
+    return parsed?.entries && typeof parsed.entries === "object"
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistCache() {
+  try {
+    mkdirSync(path.dirname(LOCAL_CACHE_FILE), { recursive: true });
+    writeFileSync(LOCAL_CACHE_FILE, encodeCache());
+  } catch {
+    // read-only filesystem (serverless) — the bundled snapshot covers cold starts
+  }
+}
+
+let cacheLoaded = false;
+function ensureCacheLoaded() {
+  if (cacheLoaded) return;
+  cacheLoaded = true;
+  const sources: Array<CacheFile | null> = [
+    bundledSnapshot as unknown as CacheFile,
+  ];
+  try {
+    sources.push(decodeCache(readFileSync(LOCAL_CACHE_FILE, "utf8")));
+  } catch {
+    // no local cache yet
+  }
+  for (const src of sources) {
+    if (!src || src.version !== CACHE_VERSION || !src.entries) continue;
+    for (const [key, entry] of Object.entries(src.entries)) {
+      if (!entry || typeof entry.at !== "number") continue;
+      const existing = readCache.get(key);
+      if (!existing || existing.at < entry.at) readCache.set(key, entry);
+    }
+  }
+}
+
+/**
+ * Call after any successful write. Cached reads are marked stale — served
+ * instantly, refreshed in the background — never cleared: a stall right
+ * after a write must not be able to blank the site. The write also kicks
+ * refreshes of the pages it touches (see warmAfterWrite).
+ */
 export function bustReadCache() {
-  readCache.clear();
+  for (const entry of readCache.values()) entry.at = 0;
+}
+
+/** Fire-and-forget refreshes so the demo's own writes show up fast. */
+function warmAfterWrite(batchCode?: string) {
+  const jobs: Array<Promise<unknown>> = [
+    getCounts(),
+    getLatestFeed(10),
+    fetchRegistries(),
+  ];
+  if (batchCode) jobs.push(getBatchReport(batchCode.toUpperCase()));
+  void Promise.allSettled(jobs);
+}
+
+function startRefresh<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const running = inflight.get(key);
+  if (running) return running as Promise<T>;
+  const p = fn()
+    .then((value) => {
+      readCache.set(key, { at: Date.now(), value });
+      persistCache();
+      return value;
+    })
+    .finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
 }
 
 async function swr<T>(
@@ -103,25 +221,42 @@ async function swr<T>(
   ttlMs: number,
   fn: () => Promise<T>
 ): Promise<T> {
+  ensureCacheLoaded();
+  startWarmer();
   const hit = readCache.get(key);
   if (hit && Date.now() - hit.at < ttlMs) return hit.value as T;
   if (hit) {
     // expired — serve instantly, refresh in the background
-    void fn()
-      .then((value) => readCache.set(key, { at: Date.now(), value }))
-      .catch(() => {});
+    void startRefresh(key, fn).catch(() => {});
     return hit.value as T;
   }
-  const running = inflight.get(key);
-  if (running) return running as Promise<T>;
-  const p = fn()
-    .then((value) => {
-      readCache.set(key, { at: Date.now(), value });
-      return value;
-    })
-    .finally(() => inflight.delete(key));
-  inflight.set(key, p);
-  return p;
+  return startRefresh(key, fn);
+}
+
+// Self-healing: every so often, refresh the pages the demo relies on, so a
+// stall window heals itself even if nobody is browsing. (On serverless this
+// interval never gets a chance to fire; the bundled snapshot covers instead.)
+let warming = false;
+function startWarmer() {
+  const g = globalThis as { __asliWarmerStarted?: boolean };
+  if (g.__asliWarmerStarted) return;
+  g.__asliWarmerStarted = true;
+  const timer = setInterval(() => {
+    if (warming) return;
+    warming = true;
+    void Promise.allSettled([
+      getCounts(),
+      getLatestFeed(10),
+      fetchRegistries(),
+      getRadar(45),
+      getBatchReport(DEMO.heroCode),
+      getBatchReport(DEMO.cleanCode),
+      getBatchReport(DEMO.quickCode),
+    ]).finally(() => {
+      warming = false;
+    });
+  }, 45_000);
+  (timer as unknown as { unref?: () => void }).unref?.();
 }
 
 // ---------------------------------------------------------------- wallets
@@ -148,6 +283,7 @@ export function walletFor(role: Role) {
     transport: http(RPC_URL, {
       timeout: 15_000,
       retryCount: 1,
+      ...rpcAuth(),
     }),
     account,
   });
@@ -609,6 +745,7 @@ export async function addCustodyScan(opts: {
   });
 
   bustReadCache();
+  warmAfterWrite(opts.batchCode);
   return {
     txHash: res.txHash as string,
     entityKey: (res.createdEntities?.[0] ?? undefined) as string | undefined,
@@ -642,6 +779,7 @@ export async function createFlag(opts: {
     flags: { readonly: true, permissionlessExtension: true },
   });
   bustReadCache();
+  warmAfterWrite(opts.batchCode);
   return { txHash: res.txHash as string, entityKey: res.entityKey as string };
 }
 
@@ -692,6 +830,7 @@ export async function counterfeitShipment(opts: {
     ],
   });
   bustReadCache();
+  warmAfterWrite(opts.batchCode);
   return {
     txHash: res.txHash as string,
     entityKeys: (res.createdEntities ?? []) as string[],
@@ -710,5 +849,6 @@ export async function extendByKey(
     expires: ExpirationTime.atBlock(await nextExpiryBlock(entityKey, days)),
   });
   bustReadCache();
+  warmAfterWrite();
   return { txHash: res.txHash as string, expiresAt: res.expiresAt as bigint };
 }

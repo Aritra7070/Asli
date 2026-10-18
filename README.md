@@ -44,6 +44,11 @@ Built for the **Arkiv: Global Tour Stop** (Devcon 8), competing in
 npm install
 npm run wallets:new        # generates 6 throwaway testnet signers into .env.local (git-ignored)
 
+# Recommended: an Arkiv access key raises the shared RPC's query budget
+# (the anonymous budget can run out under load — friction #15). Get one at
+# https://hub.arkiv.network/api-keys (select Tiramisu), then set BOTH
+# ARKIV_ACCESS_KEY and NEXT_PUBLIC_ARKIV_ACCESS_KEY in .env.local.
+
 # fund them (any of these):
 #   a) paste your funded wallet key into .env.local as FUNDER_PRIVATE_KEY, then:
 #      npm run wallets:fund
@@ -62,11 +67,15 @@ project's disposable testnet wallets**, so judges and visitors can trigger
 real writes (a pharmacy scan, a public report, a counterfeit shipment) and
 watch the live feed react.
 
-The server layer treats the shared testnet RPC defensively: every read runs
-under a 12 s deadline with one retry, and hot reads are served
-stale-while-revalidate from a tiny in-memory cache — brief RPC stalls degrade
-to slightly-stale pages instead of a frozen site (see `arkiv/friction.md` #15,
-and `npm run rpc:health` for a live latency probe).
+The server layer treats the shared testnet RPC defensively: an optional Arkiv
+access key (`ARKIV_ACCESS_KEY`) raises the RPC's anonymous query budget — the
+real failure mode we hit on submission day (friction #15: when the budget is
+out, the HTTP surface *hangs* while the WebSocket surface says so instantly).
+On top of that, every read runs under a 6 s deadline with one retry, and hot
+reads are served stale-while-revalidate from a cache that persists to disk
+and ships a committed cold-start snapshot, so even budget windows degrade to
+slightly-stale pages that heal as soon as reads recover. `npm run rpc:health`
+probes both surfaces and prints the real error.
 
 ## Verify us without us
 

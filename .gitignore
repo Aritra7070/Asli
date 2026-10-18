@@ -16,3 +16,6 @@ out/
 .vercel
 next-env.d.ts
 *.tsbuildinfo
+
+# runtime read-cache (local last-good copies; the committed fallback is arkiv/cache-snapshot.json)
+.cache/

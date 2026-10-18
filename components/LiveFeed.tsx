@@ -5,7 +5,14 @@ import { createPublicClient } from "@arkiv-network/sdk";
 import { tiramisu } from "@arkiv-network/sdk/chains";
 import { http, webSocket } from "viem";
 
-import { RPC_URL, WS_URL, shorten, timeAgo, cn } from "@/lib/constants";
+import {
+  RPC_URL,
+  WS_URL,
+  shorten,
+  timeAgo,
+  cn,
+  withAccessKey,
+} from "@/lib/constants";
 import { entityToFeedItem } from "@/lib/feed";
 import type { FeedItem } from "@/lib/types";
 
@@ -27,7 +34,7 @@ export default function LiveFeed({ initial }: { initial: FeedItem[] }) {
   useEffect(() => {
     const httpClient = createPublicClient({
       chain: tiramisu,
-      transport: http(RPC_URL),
+      transport: http(withAccessKey(RPC_URL)),
     });
 
     async function handleEvent(entityKey: string) {
@@ -59,7 +66,7 @@ export default function LiveFeed({ initial }: { initial: FeedItem[] }) {
       // (over plain HTTP the watcher would silently fall back to polling).
       const wsClient = createPublicClient({
         chain: tiramisu,
-        transport: webSocket(WS_URL),
+        transport: webSocket(withAccessKey(WS_URL)),
       });
       unwatch = wsClient.watchEntityEvents({
         onEntityCreated: (ev) => void handleEvent(ev.entityKey),
