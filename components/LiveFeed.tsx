@@ -1,19 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { createPublicClient } from "@arkiv-network/sdk";
-import { tiramisu } from "@arkiv-network/sdk/chains";
-import { http, webSocket } from "viem";
 
-import {
-  RPC_URL,
-  WS_URL,
-  shorten,
-  timeAgo,
-  cn,
-  withAccessKey,
-} from "@/lib/constants";
-import { entityToFeedItem } from "@/lib/feed";
+import { shorten, timeAgo, cn } from "@/lib/constants";
 import type { FeedItem } from "@/lib/types";
 
 const KIND_ICON: Record<string, string> = {
@@ -24,6 +13,24 @@ const KIND_ICON: Record<string, string> = {
   unknown: "•",
 };
 
+const POLL_MS = 20_000;
+const WATCHDOG_MS = 10_000;
+const STALE_MS = 40_000;
+const ES_RETRY_MS = 60_000;
+
+/**
+ * The live feed is resilient by design, in layers:
+ *
+ *  1. The server streams chain events over SSE (/api/events). The browser
+ *     never talks to the chain, so no key is exposed and one chain
+ *     connection serves every viewer. EventSource reconnects natively.
+ *  2. A watchdog: if the stream goes silent (deploy, network, serverless
+ *     restart), the feed falls back to polling /api/feed and retries the
+ *     stream a minute later.
+ *  3. The badge reports which mode the chain connection is in — the server
+ *     emits `socket` while its WebSocket subscription is up, `polling`
+ *     while it is coasting on the cached feed (friction #6/#15).
+ */
 export default function LiveFeed({ initial }: { initial: FeedItem[] }) {
   const [items, setItems] = useState<FeedItem[]>(initial);
   const [mode, setMode] = useState<"connecting" | "socket" | "polling">(
@@ -32,55 +39,130 @@ export default function LiveFeed({ initial }: { initial: FeedItem[] }) {
   const [fresh, setFresh] = useState<string | null>(null);
 
   useEffect(() => {
-    const httpClient = createPublicClient({
-      chain: tiramisu,
-      transport: http(withAccessKey(RPC_URL)),
-    });
+    let stopped = false;
+    let es: EventSource | undefined;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+    let watchdog: ReturnType<typeof setInterval> | undefined;
+    let esRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastMsgAt = Date.now();
 
-    async function handleEvent(entityKey: string) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const e: any = await httpClient.getEntity(entityKey as `0x${string}`);
-        const head = await httpClient.getBlockNumber();
-        const item = entityToFeedItem(e, head);
-        if (!item) return; // not an Asli entity
-        setItems((prev) =>
-          [item, ...prev.filter((p) => p.entityKey !== item.entityKey)].slice(
-            0,
-            14
-          )
-        );
-        setFresh(item.entityKey);
-        setTimeout(
-          () => setFresh((f) => (f === item.entityKey ? null : f)),
-          3000
-        );
-      } catch {
-        // entity expired between the event and the read — ignore
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = undefined;
       }
     }
 
-    let unwatch: (() => void) | undefined;
-    try {
-      // A WebSocket transport with no fromBlock gives a true live stream
-      // (over plain HTTP the watcher would silently fall back to polling).
-      const wsClient = createPublicClient({
-        chain: tiramisu,
-        transport: webSocket(withAccessKey(WS_URL)),
-      });
-      unwatch = wsClient.watchEntityEvents({
-        onEntityCreated: (ev) => void handleEvent(ev.entityKey),
-        onEntityPatched: (ev) => void handleEvent(ev.entityKey),
-        onExpiryExtended: (ev) => void handleEvent(ev.entityKey),
-        onError: () => setMode("polling"),
-      });
-      setMode("socket");
-    } catch {
-      setMode("polling");
+    function flash(key: string) {
+      setFresh(key);
+      setTimeout(() => setFresh((f) => (f === key ? null : f)), 3000);
     }
 
+    function mergeItems(next: FeedItem[], withFlash = false) {
+      if (stopped || !Array.isArray(next) || next.length === 0) return;
+      setItems((prev) => {
+        const seen = new Set(next.map((i) => i.entityKey));
+        return [...next, ...prev.filter((p) => !seen.has(p.entityKey))].slice(
+          0,
+          14
+        );
+      });
+      if (withFlash) flash(next[0].entityKey);
+    }
+
+    async function pollOnce() {
+      try {
+        const res = await fetch("/api/feed", { cache: "no-store" });
+        if (!res.ok) return;
+        const body = (await res.json()) as { items?: FeedItem[] };
+        if (body.items) mergeItems(body.items);
+      } catch {
+        // offline or server starting up — keep the last known list
+      }
+    }
+
+    function startPolling() {
+      setMode("polling");
+      void pollOnce();
+      if (!pollTimer) pollTimer = setInterval(() => void pollOnce(), POLL_MS);
+    }
+
+    function connect() {
+      if (stopped) return;
+      try {
+        es = new EventSource("/api/events");
+
+        const alive = () => {
+          lastMsgAt = Date.now();
+        };
+
+        es.addEventListener("mode", (ev) => {
+          alive();
+          try {
+            const m = (JSON.parse((ev as MessageEvent).data) as { mode?: string })
+              .mode;
+            if (m === "socket" || m === "polling" || m === "connecting") {
+              stopPolling();
+              setMode(m);
+            }
+          } catch {
+            // ignore malformed frame
+          }
+        });
+
+        es.addEventListener("snapshot", (ev) => {
+          alive();
+          try {
+            const next = (
+              JSON.parse((ev as MessageEvent).data) as { items?: FeedItem[] }
+            ).items;
+            if (next) mergeItems(next);
+          } catch {
+            // ignore malformed frame
+          }
+        });
+
+        es.addEventListener("item", (ev) => {
+          alive();
+          try {
+            const item = JSON.parse((ev as MessageEvent).data) as FeedItem;
+            if (item?.entityKey) mergeItems([item], true);
+          } catch {
+            // ignore malformed frame
+          }
+        });
+
+        es.addEventListener("ping", alive);
+      } catch {
+        startPolling();
+      }
+    }
+
+    connect();
+
+    watchdog = setInterval(() => {
+      if (stopped) return;
+      if (Date.now() - lastMsgAt > STALE_MS) {
+        es?.close();
+        es = undefined;
+        startPolling();
+        if (!esRetryTimer) {
+          esRetryTimer = setTimeout(() => {
+            esRetryTimer = undefined;
+            stopPolling();
+            lastMsgAt = Date.now();
+            connect();
+          }, ES_RETRY_MS);
+        }
+      }
+    }, WATCHDOG_MS);
+
     return () => {
-      unwatch?.();
+      stopped = true;
+      es?.close();
+      if (esRetryTimer) clearTimeout(esRetryTimer);
+      stopPolling();
+      if (watchdog) clearInterval(watchdog);
     };
   }, []);
 

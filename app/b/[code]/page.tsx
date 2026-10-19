@@ -191,8 +191,21 @@ export default async function BatchPage({
           {e instanceof Error ? e.message : String(e)}
         </p>
         <p className="mt-2 text-sm text-[var(--muted)]">
-          Retry in a moment — reads go straight from this server to the chain.
+          The public testnet shares a read budget that is sometimes exhausted
+          — retry in a moment. The demo batches below are always served from
+          the last synced copy:
         </p>
+        <div className="mt-4 flex flex-wrap gap-2 text-sm">
+          <Link href={`/b/${DEMO.heroCode}`} className="rounded-lg border border-[var(--line)] px-3 py-1.5 hover:bg-white/5">
+            {DEMO.heroCode}
+          </Link>
+          <Link href={`/b/${DEMO.cleanCode}`} className="rounded-lg border border-[var(--line)] px-3 py-1.5 hover:bg-white/5">
+            {DEMO.cleanCode}
+          </Link>
+          <Link href={`/b/${DEMO.quickCode}`} className="rounded-lg border border-[var(--line)] px-3 py-1.5 hover:bg-white/5">
+            {DEMO.quickCode}
+          </Link>
+        </div>
       </div>
     );
   }

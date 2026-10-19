@@ -214,16 +214,24 @@ the parts we lived with.)
   was fine on-chain.)
 - **Fix shipped (in this repo):**
   1. **Access-key support.** `ARKIV_ACCESS_KEY` is sent server-side as an
-     `X-API-KEY` header; `NEXT_PUBLIC_ARKIV_ACCESS_KEY` goes in the URL path
+     `X-API-KEY` header; `NEXT_PUBLIC_ARKIV_ACCESS_KEY` went in the URL path
      for the browser's live-feed WebSocket (browser WebSockets cannot set
-     headers). This is the actual cure, not a workaround.
+     headers) — since retired, see item 4. This is the actual cure, not a
+     workaround.
   2. **A 6 s read deadline + one retry** per chain read, so a hung request
      fails fast instead of freezing a render.
   3. **Stale-while-revalidate cache** for the hot reads (`counts`, `feed`,
      `batch:<code>`, `radar`, `registries`) — persisted to disk
      (`.cache/reads.json`) with a committed cold-start snapshot
      (`arkiv/cache-snapshot.json`); writes mark cached reads stale instead of
-     clearing them; a self-healing warmer refetches the demo pages every 45 s.
+     clearing them; a self-healing warmer refetches the demo pages on a timer
+     (cadence later slowed 45 s → 30 min with backoff — see #16).
+  4. **Server-side live stream** (added later, after #16). The browser no
+     longer talks to the chain at all: a server-side hub (`lib/live-hub.ts`)
+     holds **one** WebSocket subscription per instance and streams events to
+     every viewer over SSE (`/api/events`), with a ring buffer that replays
+     what a client missed while reconnecting. The exposed browser key from
+     item 1 is retired, and quota usage no longer scales with viewer count.
   Diagnostics in-repo: `npm run rpc:health` — it probes **both** surfaces and
   prints the real error. That probe is how this was finally found.
 - **Ask:**
@@ -237,5 +245,41 @@ the parts we lived with.)
 
 ---
 
-_Running total: 15 items. Friction is data — this file is updated as we hit
+## 16. The access key's monthly query budget can be silently drained — by your own warm-up loop
+
+- **Expected:** an access key ends the quota problem; a demo site with a
+  self-healing cache warmer should not burn a month's budget in a weekend.
+- **Actual:** the key carries a **monthly** query budget, and our first
+  warmer design — refetching every demo page every **45 s** (~18 queries per
+  cycle, ≈1,400/hour, ≈35k/day) — drained it in about two days. Queries then
+  failed with `429 QUOTA_EXCEEDED` on `arkiv_query`, while `eth_blockNumber`
+  on the same endpoint kept answering in under a second — so "node down" and
+  "query budget gone" look nearly identical from inside a health check.
+- **Why it burned us:** the deployed demo silently fell back to the
+  committed cold-start snapshot: cached pages (home, radar, the three demo
+  batches) kept rendering, but any uncached batch code dead-ended on a raw
+  error card. A reviewer typing an arbitrary code would see a broken site
+  while the demo itself was fine — the exact opposite of what the cache was
+  built to achieve.
+- **Fix shipped (in this repo):**
+  a. **Warmer cadence 45 s → 30 min, with a probe:** each cycle first issues
+     one cheap query; if it fails the cycle is skipped and the next backs
+     off exponentially (30 min → 2 h cap), so a dead budget is never
+     hammered.
+  b. **Longer stale-while-revalidate TTLs** (batch 5 min, radar 10 min,
+     counts 5 min, feed 2 min). Reads stay interactive because writes bust
+     the cache — a judge's own scan still shows up immediately.
+  c. **The error card now routes reviewers to the cached demo batches**
+     instead of dead-ending, and says the testnet read budget is shared.
+  d. `npm run reproduce` uses an optional key and, on a quota failure,
+     prints exactly how to get one — a reviewer hitting an empty anonymous
+     budget gets instructions, not a stack trace.
+- **Ask:** surface the remaining quota in the hub (and in the 429 body):
+  "quota resets in N days / N queries left" turns budgeting from guesswork
+  into arithmetic, and a per-key usage chart would make poll intervals a
+  design decision instead of a surprise.
+
+---
+
+_Running total: 16 items. Friction is data — this file is updated as we hit
 more, and shipped as-is._

@@ -135,9 +135,18 @@ function encodeCache(): string {
   );
 }
 
-function decodeCache(raw: string): CacheFile | null {
+/**
+ * Revive a cache file (the bundled snapshot object, or a parsed local cache
+ * file): `{__bigint: "…"}` placeholders written by encodeCache become real
+ * bigints again, so cached values are typed exactly like freshly fetched
+ * ones. Without this, bigint fields served from the bundled snapshot are
+ * plain objects — bigint arithmetic silently yields NaN ("Attested —
+ * Invalid Date" on cold-start pages).
+ */
+function reviveCacheFile(src: unknown): CacheFile | null {
+  if (!src) return null;
   try {
-    const parsed = JSON.parse(raw, (_k, v) =>
+    const parsed = JSON.parse(JSON.stringify(src), (_k, v) =>
       v && typeof v === "object" && "__bigint" in (v as object)
         ? BigInt((v as { __bigint: string }).__bigint)
         : v
@@ -164,10 +173,12 @@ function ensureCacheLoaded() {
   if (cacheLoaded) return;
   cacheLoaded = true;
   const sources: Array<CacheFile | null> = [
-    bundledSnapshot as unknown as CacheFile,
+    reviveCacheFile(bundledSnapshot),
   ];
   try {
-    sources.push(decodeCache(readFileSync(LOCAL_CACHE_FILE, "utf8")));
+    sources.push(
+      reviveCacheFile(JSON.parse(readFileSync(LOCAL_CACHE_FILE, "utf8")))
+    );
   } catch {
     // no local cache yet
   }
@@ -234,29 +245,52 @@ async function swr<T>(
 }
 
 // Self-healing: every so often, refresh the pages the demo relies on, so a
-// stall window heals itself even if nobody is browsing. (On serverless this
-// interval never gets a chance to fire; the bundled snapshot covers instead.)
+// stall window heals itself even if nobody is browsing. Each cycle starts
+// with one cheap probe query; if the probe fails (read budget exhausted,
+// node down) the cycle is skipped and the next one backs off — starting at
+// 30 min and doubling to 2 h — so a dead quota is never hammered. The access
+// key carries a monthly query budget (see friction.md #15/#16): this loop is
+// deliberately sized so a deployed demo lasts the entire review window.
+// (On serverless this loop rarely gets a chance to fire; the bundled
+// snapshot covers instead.)
+const WARM_BASE_MS = 30 * 60_000;
+const WARM_MAX_MS = 2 * 60 * 60_000;
 let warming = false;
 function startWarmer() {
   const g = globalThis as { __asliWarmerStarted?: boolean };
   if (g.__asliWarmerStarted) return;
   g.__asliWarmerStarted = true;
-  const timer = setInterval(() => {
-    if (warming) return;
-    warming = true;
-    void Promise.allSettled([
-      getCounts(),
-      getLatestFeed(10),
-      fetchRegistries(),
-      getRadar(45),
-      getBatchReport(DEMO.heroCode),
-      getBatchReport(DEMO.cleanCode),
-      getBatchReport(DEMO.quickCode),
-    ]).finally(() => {
-      warming = false;
-    });
-  }, 45_000);
-  (timer as unknown as { unref?: () => void }).unref?.();
+  let delay = WARM_BASE_MS;
+  function schedule(ms: number) {
+    const t = setTimeout(tick, ms);
+    (t as unknown as { unref?: () => void }).unref?.();
+  }
+  async function tick() {
+    if (!warming) {
+      warming = true;
+      try {
+        await chainCall("warm probe", () =>
+          fetchWhere(eq("type", str("asli.batch")), 1)
+        );
+        await Promise.allSettled([
+          getCounts(),
+          getLatestFeed(10),
+          fetchRegistries(),
+          getRadar(45),
+          getBatchReport(DEMO.heroCode),
+          getBatchReport(DEMO.cleanCode),
+          getBatchReport(DEMO.quickCode),
+        ]);
+        delay = WARM_BASE_MS;
+      } catch {
+        delay = Math.min(delay * 2, WARM_MAX_MS);
+      } finally {
+        warming = false;
+      }
+    }
+    schedule(delay);
+  }
+  schedule(WARM_BASE_MS);
 }
 
 // ---------------------------------------------------------------- wallets
@@ -410,7 +444,7 @@ async function fetchWhere(where: unknown, limit = 200): Promise<E[]> {
 // ---------------------------------------------------------------- reads
 
 export async function fetchRegistries(): Promise<Record<string, Registry>> {
-  return swr("registries", 30_000, async () => {
+  return swr("registries", 600_000, async () => {
     const entities = await fetchAll(eq("type", str("asli.registry")));
     const map: Record<string, Registry> = {};
     for (const e of entities) {
@@ -556,11 +590,11 @@ async function computeBatchReport(code: string): Promise<BatchReport> {
 
 /** Cached getter — writes bust the cache (see bustReadCache). */
 export async function getBatchReport(code: string): Promise<BatchReport> {
-  return swr(`batch:${code}`, 15_000, () => computeBatchReport(code));
+  return swr(`batch:${code}`, 300_000, () => computeBatchReport(code));
 }
 
 export async function getRadar(soonDays = 45): Promise<RadarData> {
-  return swr(`radar:${soonDays}`, 30_000, () => computeRadar(soonDays));
+  return swr(`radar:${soonDays}`, 600_000, () => computeRadar(soonDays));
 }
 
 async function computeRadar(soonDays = 45): Promise<RadarData> {
@@ -617,7 +651,7 @@ async function computeRadar(soonDays = 45): Promise<RadarData> {
 }
 
 export async function getCounts() {
-  return swr("counts", 15_000, async () => {
+  return swr("counts", 300_000, async () => {
     const [batches, custody, flags, registries] = await Promise.all([
       fetchAll(eq("type", str("asli.batch"))),
       fetchAll(eq("type", str("asli.custody"))),
@@ -675,7 +709,7 @@ export function toFeedItem(e: E, head: bigint): FeedItem {
 }
 
 export async function getLatestFeed(limit = 12): Promise<FeedItem[]> {
-  return swr(`feed:${limit}`, 10_000, async () => {
+  return swr(`feed:${limit}`, 120_000, async () => {
     const head = await chainCall("blockNumber", () =>
       publicClient.getBlockNumber()
     );

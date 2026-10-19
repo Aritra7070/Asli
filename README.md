@@ -38,7 +38,7 @@ Built for the **Arkiv: Global Tour Stop** (Devcon 8), competing in
 | **Living Records** | A batch record's life is tied to the medicine. Every scan performs a **Lifetime Extension** (+30 days on the record's current deadline, `permissionlessExtension`); if nobody vouches, the record expires on its own. |
 | **Recall Forever** | Recalls are `readonly` (write-once, un-editable) and **anyone** can renew them — the issuer can't quietly take a warning down. |
 | **Expiry Radar** | A true `u64` range query: everything expiring within N days, straight off the chain. |
-| **Live feed** | `watchEntityEvents` over WebSocket, no `fromBlock` — you watch your own clicks land on-chain in real time. |
+| **Live feed** | A server-side `watchEntityEvents` subscription (WebSocket, no `fromBlock`) streamed to every browser via SSE — one chain connection serves all viewers, and the access key never leaves the server. |
 
 ## How to run it (5 minutes)
 
@@ -48,8 +48,8 @@ npm run wallets:new        # generates 6 throwaway testnet signers into .env.loc
 
 # Recommended: an Arkiv access key raises the shared RPC's query budget
 # (the anonymous budget can run out under load — friction #15). Get one at
-# https://hub.arkiv.network/api-keys (select Tiramisu), then set BOTH
-# ARKIV_ACCESS_KEY and NEXT_PUBLIC_ARKIV_ACCESS_KEY in .env.local.
+# https://hub.arkiv.network/api-keys (select Tiramisu) and set
+# ARKIV_ACCESS_KEY in .env.local. Server-side only — the browser never sees it.
 
 # fund them (any of these):
 #   a) paste your funded wallet key into .env.local as FUNDER_PRIVATE_KEY, then:
@@ -95,10 +95,11 @@ UI. If the site and the chain disagree, the site is wrong.
 app/                Next.js App Router pages + API routes (server-signing demo writes)
 components/         UI (search, live feed, demo panel, batch actions)
 lib/arkiv-server.ts Reads (public client) + demo writes (role signers) — the verification engine
+lib/live-hub.ts     One server-side chain subscription, streamed to browsers as SSE (/api/events)
 lib/{types,feed,constants}.ts
 scripts/            wallets.mjs · fund.mjs · seed.mjs · reproduce.mjs · vercel-env.mjs
 arkiv/schema.md     Entity design: attributes, expiries, flags, queries, what stays off Arkiv
-arkiv/friction.md   Honest expected-vs-actual log from building on Arkiv (15 items, with versions and repro steps)
+arkiv/friction.md   Honest expected-vs-actual log from building on Arkiv (16 items, with versions and repro steps)
 ```
 
 ## Stack
